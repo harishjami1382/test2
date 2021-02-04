@@ -1,0 +1,348 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+import datetime
+import logging
+import os
+import socket
+from datetime import timedelta
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+import flask
+import flask_login
+from flask import Flask, url_for, session as flask_session
+from flask_appbuilder import SQLA, AppBuilder
+from flask_appbuilder.baseviews import BaseView
+from flask_caching import Cache
+from flask_wtf.csrf import CSRFProtect
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+from airflow import settings, version
+from airflow.configuration import conf
+from airflow.logging_config import configure_logging
+from airflow.utils.json import AirflowJsonEncoder
+from airflow.www.static_config import configure_manifest_files
+from airflow.utils.qubole_utils import proxified_get_redirect
+from airflow.utils.qubole_utils import proxified_get_url_for_index, proxified_get_url_for_login
+
+app = None  # type: Any
+appbuilder = None  # type: Optional[AppBuilder]
+csrf = CSRFProtect()
+
+log = logging.getLogger(__name__)
+
+
+def create_app(config=None, session=None, testing=False, app_name="Airflow"):
+
+    cluster_id = os.getenv('CLUSTER_ID', "")
+    cdn_url = 'https://d3chibfrmv0usk.cloudfront.net/airflow/v1.10.9'
+
+    airflow_webserver_proxy_uri = "airflow-webserver-{0}".format(cluster_id)
+    airflow_webserver_proxy_admin_uri = "/{0}/home".format(airflow_webserver_proxy_uri)
+
+
+    global app, appbuilder
+    app = Flask(__name__)
+    if conf.getboolean('webserver', 'ENABLE_PROXY_FIX'):
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=conf.getint("webserver", "PROXY_FIX_X_FOR", fallback=1),
+            x_proto=conf.getint("webserver", "PROXY_FIX_X_PROTO", fallback=1),
+            x_host=conf.getint("webserver", "PROXY_FIX_X_HOST", fallback=1),
+            x_port=conf.getint("webserver", "PROXY_FIX_X_PORT", fallback=1),
+            x_prefix=conf.getint("webserver", "PROXY_FIX_X_PREFIX", fallback=1)
+        )
+    app.secret_key = conf.get('webserver', 'SECRET_KEY')
+
+    session_lifetime_days = conf.getint('webserver', 'SESSION_LIFETIME_DAYS', fallback=30)
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=session_lifetime_days)
+
+    app.config.from_pyfile(settings.WEBSERVER_CONFIG, silent=True)
+    app.config['APP_NAME'] = app_name
+    app.config['TESTING'] = testing
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SECURE'] = conf.getboolean('webserver', 'COOKIE_SECURE')
+    app.config['SESSION_COOKIE_SAMESITE'] = conf.get('webserver', 'COOKIE_SAMESITE')
+
+    if config:
+        app.config.from_mapping(config)
+
+    # Configure the JSON encoder used by `|tojson` filter from Flask
+    app.json_encoder = AirflowJsonEncoder
+
+    csrf.init_app(app)
+    app.config["SESSION_PROTECTION"] = False
+    app.config["SESSION_COOKIE_NAME"] = "webserver_{}_session".format(cluster_id)
+
+    db = SQLA(app)
+
+    def can_see_profile(user):
+        for role in user.roles:
+            for perms in role.permissions:
+                if perms.permission.name == "can_userinfo":
+                    return True
+        return False
+
+
+    app.jinja_env.tests['can_see_profile'] = can_see_profile
+
+    BaseView.get_redirect = proxified_get_redirect
+    AppBuilder.get_url_for_index = proxified_get_url_for_index
+    AppBuilder.get_url_for_login = proxified_get_url_for_login
+
+    from airflow import api
+    api.load_auth()
+    api.API_AUTH.api_auth.init_app(app)
+
+    Cache(app=app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
+
+    from airflow.www.blueprints import routes
+    app.register_blueprint(routes)
+
+    configure_logging()
+    configure_manifest_files(app)
+
+    with app.app_context():
+        from airflow.www.qubole_security import QuboleSecurityManager
+        security_manager_class = QuboleSecurityManager
+
+        # if not issubclass(security_manager_class, AirflowSecurityManager):
+        #     raise Exception(
+        #         """Your CUSTOM_SECURITY_MANAGER must now extend AirflowSecurityManager,
+        #          not FAB's security manager.""")
+
+        from airflow.utils.qubole_utils import override_route_base
+        override_route_base("appbuilder")
+        appbuilder = AppBuilder(
+            app,
+            db.session if not session else session,
+            security_manager_class=security_manager_class,
+            base_template='airflow/master.html',
+            update_perms=conf.getboolean('webserver', 'UPDATE_FAB_PERMS'))
+
+        def init_views(appbuilder):
+            override_route_base("airflow")
+            from airflow.www import views
+            # Remove the session from scoped_session registry to avoid
+            # reusing a session with a disconnected connection
+
+            appbuilder.session.remove()
+            appbuilder.add_view_no_menu(views.Airflow())
+            appbuilder.add_view_no_menu(views.DagModelView())
+            appbuilder.add_view(views.DagRunModelView,
+                                "DAG Runs",
+                                category="Browse",
+                                category_icon="fa-globe")
+            appbuilder.add_view(views.JobModelView,
+                                "Jobs",
+                                category="Browse")
+            appbuilder.add_view(views.LogModelView,
+                                "Logs",
+                                category="Browse")
+            appbuilder.add_view(views.SlaMissModelView,
+                                "SLA Misses",
+                                category="Browse")
+            appbuilder.add_view(views.TaskInstanceModelView,
+                                "Task Instances",
+                                category="Browse")
+            appbuilder.add_view(views.ConfigurationView,
+                                "Configurations",
+                                category="Admin",
+                                category_icon="fa-user")
+            appbuilder.add_view(views.ConnectionModelView,
+                                "Connections",
+                                category="Admin")
+            appbuilder.add_view(views.PoolModelView,
+                                "Pools",
+                                category="Admin")
+            appbuilder.add_view(views.VariableModelView,
+                                "Variables",
+                                category="Admin")
+            appbuilder.add_view(views.XComModelView,
+                                "XComs",
+                                category="Admin")
+
+            if "dev" in version.version:
+                airflow_doc_site = "https://airflow.readthedocs.io/en/latest"
+            else:
+                airflow_doc_site = 'https://airflow.apache.org/docs/1.10.9'
+
+            appbuilder.add_link("Website",
+                                href='https://airflow.apache.org',
+                                category="Docs",
+                                category_icon="fa-globe")
+            appbuilder.add_link("Documentation",
+                                href=airflow_doc_site,
+                                category="Docs",
+                                category_icon="fa-cube")
+            appbuilder.add_link("GitHub",
+                                href='https://github.com/apache/airflow',
+                                category="Docs")
+            appbuilder.add_link("Qubole Documentation",
+                                href='http://docs.qubole.com/en/latest/user-guide/airflow/index.html',
+                                category="Docs",
+                                category_icon="fa-cube")
+            appbuilder.add_link("Blog",
+                                href='https://www.qubole.com/tech-category/airflow/',
+                                category="Docs",
+                                category_icon="fa-cube")
+            appbuilder.add_link("Video Tutorial",
+                                href='https://www.youtube.com/watch?v=4_Ifm4PNRyg&list=PL5_c35Deekdm6N1OBHdQm7JZECTdm7zl-',
+                                category="Docs",
+                                category_icon="fa-cube")
+            appbuilder.add_view(views.VersionView,
+                                'Version',
+                                category='About',
+                                category_icon='fa-th')
+
+            def integrate_plugins():
+                """Integrate plugins to the context"""
+                from airflow.plugins_manager import (
+                    flask_appbuilder_views, flask_appbuilder_menu_links
+                )
+
+                for v in flask_appbuilder_views:
+                    log.debug("Adding view %s", v["name"])
+                    appbuilder.add_view(v["view"],
+                                        v["name"],
+                                        category=v["category"])
+                for ml in sorted(flask_appbuilder_menu_links, key=lambda x: x["name"]):
+                    log.debug("Adding menu link %s", ml["name"])
+                    appbuilder.add_link(ml["name"],
+                                        href=ml["href"],
+                                        category=ml["category"],
+                                        category_icon=ml["category_icon"])
+
+            integrate_plugins()
+            # Garbage collect old permissions/views after they have been modified.
+            # Otherwise, when the name of a view or menu is changed, the framework
+            # will add the new Views and Menus names to the backend, but will not
+            # delete the old ones.
+
+        def init_plugin_blueprints(app):
+            from airflow.plugins_manager import flask_blueprints
+
+            for bp in flask_blueprints:
+                log.debug("Adding blueprint %s:%s", bp["name"], bp["blueprint"].import_name)
+                app.register_blueprint(bp["blueprint"])
+
+        init_views(appbuilder)
+        init_plugin_blueprints(app)
+
+        if conf.getboolean('webserver', 'UPDATE_FAB_PERMS'):
+            security_manager = appbuilder.sm
+            security_manager.sync_roles()
+
+        from airflow.www.api.experimental import endpoints as e
+        # required for testing purposes otherwise the module retains
+        # a link to the default_auth
+        if app.config['TESTING']:
+            import importlib
+            importlib.reload(e)
+
+        airflow_webserver_proxy_uri = os.environ.get('AIRFLOW_WEBSERVER_PROXY_URI', "")
+        app.register_blueprint(e.api_experimental, url_prefix='/{}/api/experimental'.format(airflow_webserver_proxy_uri))
+
+        @app.context_processor
+        def jinja_globals():  # pylint: disable=unused-variable
+
+            globals = {
+                'hostname': socket.getfqdn() if conf.getboolean(
+                    'webserver', 'EXPOSE_HOSTNAME', fallback=True) else 'redact',
+                'navbar_color': conf.get(
+                    'webserver', 'NAVBAR_COLOR'),
+                'cluster_id': cluster_id,
+                'log_fetch_delay_sec': conf.getint(
+                    'webserver', 'log_fetch_delay_sec', fallback=2),
+                'log_auto_tailing_offset': conf.getint(
+                    'webserver', 'log_auto_tailing_offset', fallback=30),
+                'log_animation_speed': conf.getint(
+                    'webserver', 'log_animation_speed', fallback=1000)
+            }
+
+            if 'analytics_tool' in conf.getsection('webserver'):
+                globals.update({
+                    'analytics_tool': conf.get('webserver', 'ANALYTICS_TOOL'),
+                    'analytics_id': conf.get('webserver', 'ANALYTICS_ID')
+                })
+
+            return globals
+
+        @app.before_request
+        def before_request():
+            _force_log_out_after = conf.getint('webserver', 'FORCE_LOG_OUT_AFTER', fallback=0)
+            if _force_log_out_after > 0:
+                flask.session.permanent = True
+                app.permanent_session_lifetime = datetime.timedelta(minutes=_force_log_out_after)
+                flask.session.modified = True
+                flask.g.user = flask_login.current_user
+
+        @app.after_request
+        def apply_caching(response):
+            _x_frame_enabled = conf.getboolean('webserver', 'X_FRAME_ENABLED', fallback=True)
+            if not _x_frame_enabled:
+                response.headers["X-Frame-Options"] = "DENY"
+            return response
+
+        @app.teardown_appcontext
+        def shutdown_session(exception=None):  # pylint: disable=unused-variable
+            settings.Session.remove()
+
+        @app.before_request
+        def make_session_permanent():
+            flask_session.permanent = True
+
+        @app.before_request
+        def clear_cookies():
+            from flask import session
+            user_id = session.get('user_id', None)
+            if user_id:
+                from airflow.settings import Session
+                from flask_appbuilder.security.sqla.models import User
+                user = Session.query(User).filter_by(id = user_id).first()
+                if user is None:
+                    session.clear()
+
+    return app, appbuilder
+
+
+def root_app(env, resp):
+    resp(b'404 Not Found', [('Content-Type', 'text/plain')])
+    return [b'Apache Airflow is not at this location']
+
+
+def cached_app(config=None, session=None, testing=False):
+    global app, appbuilder
+    if not app or not appbuilder:
+        base_url = urlparse(conf.get('webserver', 'base_url'))[2]
+        if not base_url or base_url == '/':
+            base_url = ""
+
+        app, _ = create_app(config, session, testing)
+        # app = DispatcherMiddleware(root_app, {base_url: app})
+    return app
+
+
+def cached_appbuilder(config=None, testing=False):
+    global appbuilder
+    cached_app(config=config, testing=testing)
+    return appbuilder

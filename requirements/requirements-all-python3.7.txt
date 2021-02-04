@@ -1,0 +1,6 @@
+# This file will contain all the non-essential package for Airflow.
+# Will be used in the docker image for Airflow.
+redis==3.2.0
+awscli==1.16.60
+
+-r requirements-python3.7.txt

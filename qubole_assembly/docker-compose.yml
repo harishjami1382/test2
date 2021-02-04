@@ -1,0 +1,138 @@
+version: '2.1'
+services:
+
+  redis:
+    image: redis
+
+  postgres:
+    image: postgres:9.6
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+      - AIRFLOW_PROCESS_LOGS_DIR=/usr/lib/airflow
+    # Uncomment these lines to persist data on the local filesystem.
+    #     - PGDATA=/var/lib/postgresql/data/pgdata
+    # volumes:
+    #     - ./pgdata:/var/lib/postgresql/data/pgdata
+
+  webserver:
+    image: 330183209093.dkr.ecr.us-east-1.amazonaws.com/airflow:49c0901e58c620cfcbf6ee877e06da96
+    restart: always
+    depends_on:
+      - postgres
+    environment:
+      - LOAD_EX=n
+      - FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW_PROCESS_LOGS_DIR=/usr/lib/airflow
+      - AIRFLOW_HOME=/usr/lib/airflow
+      - CLUSTER_ID=1
+      - AIRFLOW_ENV_VAR_FILE=/etc/profile.d/airflow.sh
+      - QUBOLE_BASE_URL=''
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW_WEBSERVER_PROXY_URI=airflow-rbacwebserver-1
+
+
+      # - POSTGRES_USER=airflow
+      # - POSTGRES_PASSWORD=airflow
+      # - POSTGRES_DB=airflow
+      # - REDIS_PASSWORD=redispass
+    volumes:
+      - ./folder_airflow/dags:/usr/lib/airflow/dags
+      - ./folder_airflow/airflow.sh:/etc/profile.d/airflow.sh
+      - ./folder_airflow/s3cfg.yml:/usr/lib/hustler/s3cfg
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/dags
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/scheduler_task_logs
+      # Uncomment to include custom plugins
+      # - ./plugins:/usr/local/airflow/plugins
+    ports:
+      - "8080:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /usr/local/airflow/airflow-webserver.pid ]"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+  flower:
+    image: 330183209093.dkr.ecr.us-east-1.amazonaws.com/airflow:49c0901e58c620cfcbf6ee877e06da96
+    restart: always
+    volumes:
+      - ./folder_airflow/dags:/usr/lib/airflow/dags
+      - ./folder_airflow/airflow.sh:/etc/profile.d/airflow.sh
+      - ./folder_airflow/s3cfg.yml:/usr/lib/hustler/s3cfg
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/dags
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/scheduler_task_logs
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW_PROCESS_LOGS_DIR=/usr/lib/airflow
+      - AIRFLOW_HOME=/usr/lib/airflow
+      - CLUSTER_ID=1
+      - AIRFLOW_ENV_VAR_FILE=/etc/profile.d/airflow.sh
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW_WEBSERVER_PROXY_URI=airflow-rbacwebserver-1
+
+      # - REDIS_PASSWORD=redispass
+    ports:
+      - "5555:5555"
+    command: flower
+
+  scheduler:
+    image: 330183209093.dkr.ecr.us-east-1.amazonaws.com/airflow:49c0901e58c620cfcbf6ee877e06da96
+    restart: always
+    depends_on:
+      - webserver
+    volumes:
+      - ./folder_airflow/dags:/usr/lib/airflow/dags
+      - ./folder_airflow/airflow.sh:/etc/profile.d/airflow.sh
+      - ./folder_airflow/s3cfg.yml:/usr/lib/hustler/s3cfg
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/dags
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/scheduler_task_logs
+      # Uncomment to include custom plugins
+      # - ./plugins:/usr/local/airflow/plugins
+    environment:
+      - LOAD_EX=n
+      - FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW_PROCESS_LOGS_DIR=/usr/lib/airflow
+      - AIRFLOW_HOME=/usr/lib/airflow
+      - CLUSTER_ID=1
+      - AIRFLOW_ENV_VAR_FILE=/etc/profile.d/airflow.sh
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW_WEBSERVER_PROXY_URI=airflow-rbacwebserver-1
+      # - POSTGRES_USER=airflow
+      # - POSTGRES_PASSWORD=airflow
+      # - POSTGRES_DB=airflow
+      # - REDIS_PASSWORD=redispass
+    command: scheduler
+
+  worker:
+    image: 330183209093.dkr.ecr.us-east-1.amazonaws.com/airflow:49c0901e58c620cfcbf6ee877e06da96
+    restart: always
+    depends_on:
+      - scheduler
+      - redis
+    volumes:
+      - ./folder_airflow/dags:/usr/lib/airflow/dags
+      - ./folder_airflow/airflow.sh:/etc/profile.d/airflow.sh
+      - ./folder_airflow/s3cfg.yml:/usr/lib/hustler/s3cfg
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/dags
+      - ./folder_airflow/logs:/media/ephemeral0/logs/airflow/scheduler_task_logs
+    environment:
+      - FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW_PROCESS_LOGS_DIR=/usr/lib/airflow
+      - AIRFLOW_HOME=/usr/lib/airflow
+      - CLUSTER_ID=1
+      - AIRFLOW_ENV_VAR_FILE=/etc/profile.d/airflow.sh
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql://airflow:airflow@postgres/airflow
+      - AIRFLOW_WEBSERVER_PROXY_URI=airflow-rbacwebserver-1
+      # - POSTGRES_USER=airflow
+      # - POSTGRES_PASSWORD=airflow
+      # - POSTGRES_DB=airflow
+      # - REDIS_PASSWORD=redispass
+    command: worker

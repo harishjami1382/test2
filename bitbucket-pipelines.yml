@@ -1,0 +1,12 @@
+# This is a Bitbucket pipeline configuration file for Airflow
+image: python:3.7.3
+
+pipelines:
+  pull-requests:
+    '**':
+      - step: # Install all the dependencies required and run all the airflow tests
+          caches:
+            - pip
+          name: Install Dependencies and Run Unit Tests
+          script:
+            - ./scripts/ci/ci_run_pytests.sh
